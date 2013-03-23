@@ -1,6 +1,6 @@
 function getString(key,def){
 	var v=widget.preferences.getItem(key);
-	if(v==null) return def;
+	if(v==null) (v=def)&&widget.preferences.setItem(key,v);
 	return v;
 }
 function setString(key,val){widget.preferences.setItem(key,val||'');}
@@ -34,7 +34,7 @@ var _=getI18nString;
 try{loadMessages();}catch(e){opera.postError(e);}
 function format(){
 	var a=arguments;
-	if(a[0]) return a[0].replace(/\$(?:\{(\d+)\}|(\d+))/g,function(v,g1,g2){return a[g1||g2]||v;});
+	if(a[0]) return a[0].replace(/\$(?:\{(\d+)\}|(\d+))/g,function(v,g1,g2){g1=a[g1||g2];if(g1==undefined) g1=v;return g1;});
 }
 
 /* ===============Data format 0.4==================
@@ -53,11 +53,6 @@ function format(){
 
 (function(){	// upgrade data
 	var version=getItem('version_storage',0),scripts=getItem('scripts');
-	if(version<0.3) scripts&&scripts.forEach(function(i){
-		if(!i.id) i.id=Date.now()+Math.random().toString().substr(1);
-		if(!i.custom) i.custom={};
-		if('url' in i) {i.custom.homepage=i.url;delete i.url;}
-	});
 	if(version<0.4) {
 		var i,cache=getItem('cache');
 		for(i=0;i<widget.preferences.length;i++) {
@@ -108,7 +103,6 @@ function newScript(save){
 	var r={
 		custom:{},
 		meta:newMeta(),
-		url:'',
 		enabled:1,
 		update:1,
 		code:'// ==UserScript==\n// @name New Script\n// ==/UserScript==\n'
@@ -164,16 +158,16 @@ function testURL(url,e){
 	return f;
 }
 function findScript(e,url){
-	var i,c=[],v;
+	var i,j,c=[],cache={};
 	url=url||e.origin;	// to recognize URLs like data:...
+	function getCache(i){cache[i]=getString('cache:'+i);}
 	if(url.substr(0,5)!='data:') ids.forEach(function(i){
-		if(testURL(url,map[i])) c.push(map[i]);
+		if(!testURL(url,map[i])) return;
+		c.push(i=map[i]);
+		if(i.meta.require) i.meta.require.forEach(getCache);
+		for(j in i.meta.resources) getCache(i.meta.resources[j]);
 	});
-	e.source.postMessage({topic:'FoundScript',data:{isApplied:isApplied,data:c}});
-}
-function loadCache(e,d){
-	for(var i in d) d[i]=getString('cache:'+i);
-	e.source.postMessage({topic:'LoadedCache',data:d});
+	e.source.postMessage({topic:'FoundScript',data:{isApplied:isApplied,data:c,cache:cache}});
 }
 function parseMeta(d,meta){
 	var o=-1;
@@ -194,17 +188,22 @@ function parseMeta(d,meta){
 	delete meta.resource;
 	return meta;
 }
-function fetchURL(url,callback,type){
+function fetchURL(url,cb,type){
 	var req=new XMLHttpRequest();
 	req.open('GET',url,true);
 	if(type) req.responseType=type;
-	if(callback) req.onload=callback;
+	if(cb) req.onloadend=cb;
 	req.send();
 }
 function fetchCache(url){
-	fetchURL(url,function(){
-		if(this.status==200) setString('cache:'+url,String.fromCharCode.apply(this,this.response));
-	},'arraybuffer');	// Opera 11.64 does not support Blob
+	setTimeout(function(){
+		fetchURL(url,function(){
+			if(this.status!=200) return;
+			var r=new FileReader();
+			r.onload=function(e){setString('cache:'+url,e.target.result);};
+			r.readAsBinaryString(this.response);
+		},'blob');
+	},0);
 }
 
 function parseScript(e,d,c){
@@ -221,10 +220,10 @@ function parseScript(e,d,c){
 				}
 				if(i==ids.length) i=-1;
 			} else i=-1;
-			if(i<0) {c=newScript();t='add';r.message=_('Script installed.');i=ids.length;}
-			else c=map[ids[i]];
+			if(i<0) c=newScript(); else c=map[ids[i]];
 		} else i=ids.indexOf(c.id);
-		meta.custom=c.meta.custom;c.meta=meta;c.code=d.code;
+		if(i<0){t='add';r.message=_('Script installed.');i=ids.length;}
+		c.meta=meta;c.code=d.code;
 		if(e&&!/^(file|data):/.test(e.origin)&&!c.meta.homepage) c.custom.homepage=e.origin;
 		saveScript(c);
 		meta.require.forEach(fetchCache);	// @require
@@ -248,23 +247,22 @@ function getRequestId(e){
 	e.source.postMessage({topic:'GotRequestId',data:id});
 }
 function httpRequest(e,details){
-	function callback(type){
+	function callback(evt){
 		var d={
 			topic:'HttpRequested',
-			data:{id:details.id}
+			data:{
+				id:details.id,
+				type:evt.type,
+				data:{
+					readyState:req.readyState,
+					responseHeaders:req.getAllResponseHeaders(),
+					responseText:req.responseText,
+					status:req.status,
+					statusText:req.statusText,
+				}
+			}
 		};
-		if(type) d.data.type=type;
-		return function(evt){	// evt is undefined for Opera 11.64
-			if(evt&&evt.type) d.data.type=evt.type;
-			d.data.data={
-				readyState:req.readyState,
-				responseHeaders:req.getAllResponseHeaders(),
-				responseText:req.responseText,
-				status:req.status,
-				statusText:req.statusText,
-			};
-			e.source.postMessage(d);
-		};
+		e.source.postMessage(d);
 	}
 	var i,req;
 	if(details.id) req=requests[details.id];
@@ -273,10 +271,9 @@ function httpRequest(e,details){
 		req.open(details.method,details.url,details.async,details.user,details.password);
 		if(details.headers) for(i in details.headers) req.setRequestHeader(i,details.headers[i]);
 		if(details.overrideMimeType) req.overrideMimeType(details.overrideMimeType);
-		req.onload=callback('load');
-		req.onreadystatechange=callback('readystatechange');
+		['abort','error','load','progress','readystatechange','timeout'].forEach(function(i){req['on'+i]=callback;});
 		req.send(details.data);
-		if(!details.id) callback()();
+		if(!details.id) callback({type:'load'});
 	}catch(e){opera.postError(e);}
 }
 function abortRequest(e,id){
@@ -288,7 +285,6 @@ function abortRequest(e,id){
 var isApplied=getItem('isApplied',true),installFile=getItem('installFile',true),
     search=getString('search',_('Search$1')),messages={
 	'FindScript':findScript,
-	'LoadCache':loadCache,
 	'InstallScript':installScript,
 	'ParseScript':parseScript,
 	'GetRequestId':getRequestId,
@@ -317,7 +313,7 @@ var button = opera.contexts.toolbar.createItem({
 		width:222,
 		height:100
 	}
-    }),options={},optionsURL=new RegExp('^'+(location.protocol+'//'+location.host+'/options.html').replace(/\./g,'\\.'));
+}),options={},optionsURL=new RegExp('^'+(location.protocol+'//'+location.host+'/options.html').replace(/\./g,'\\.'));
 updateIcon();
 showButton(getItem('showButton',true));
 opera.extension.tabs.oncreate=function(e){
